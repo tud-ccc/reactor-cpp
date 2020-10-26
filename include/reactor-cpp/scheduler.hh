@@ -42,6 +42,7 @@ class Scheduler {
 
   std::mutex m_event_queue;
   std::map<Tag, std::unique_ptr<EventMap>> event_queue;
+  std::unique_ptr<EventMap> next_microstep_event_map;
 
   std::vector<BasePort*> set_ports;
 

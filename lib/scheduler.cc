@@ -87,7 +87,7 @@ bool Scheduler::next() {
     std::unique_lock<std::mutex> lock{m_schedule};
 
     // shutdown if there are no more events in the queue
-    if (event_queue.empty() && !_stop) {
+    if (event_queue.empty() && !_stop && next_microstep_event_map->empty()) {
       if (_environment->run_forever()) {
         // wait for a new asynchronous event
         cv_schedule.wait(lock, [this]() { return !event_queue.empty(); });
@@ -119,45 +119,58 @@ bool Scheduler::next() {
         return false;
       }
     } else {
-      // collect events of the next tag
-      auto t_next = event_queue.begin()->first;
+      if (next_microstep_event_map->size() > 0) {
+        log::Debug() << "Shortcut!\n";
 
-      // synchronize with physical time if not in fast forward mode
-      if (!_environment->fast_fwd_execution()) {
-        // keep track of the current physical time in a static variable
-        static auto physical_time = TimePoint::min();
+        events = std::move(next_microstep_event_map);
+        next_microstep_event_map = std::make_unique<EventMap>();
 
-        // If physical time is smaller than the next logical time point, then
-        // update the physical time. This step is small optimization to avoid
-        // calling get_physical_time() in every iteration as this would add
-        // a significant overhead.
-        if (physical_time < t_next.time_point())
-          physical_time = get_physical_time();
+        // advance logical time by one microstep
+        auto t_next = Tag::from_logical_time(_logical_time).delay();
+        log::Debug() << "advance logical time to tag [" << t_next.time_point()
+                     << ", " << t_next.micro_step() << "]";
+        _logical_time.advance_to(t_next);
+      } else {
+        // collect events of the next tag
+        auto t_next = event_queue.begin()->first;
 
-        // If physical time is still smaller than the next logical time point,
-        // then wait until the next tag or until a new event is inserted
-        // asynchronously into the queue
-        if (physical_time < t_next.time_point()) {
-          auto status = cv_schedule.wait_until(lock, t_next.time_point());
-          // Start over if the event queue was modified
-          if (status == std::cv_status::no_timeout) {
-            return true;
-          } else {
-            // update physical time and continue otherwise
-            physical_time = t_next.time_point();
+        // synchronize with physical time if not in fast forward mode
+        if (!_environment->fast_fwd_execution()) {
+          // keep track of the current physical time in a static variable
+          static auto physical_time = TimePoint::min();
+
+          // If physical time is smaller than the next logical time point, then
+          // update the physical time. This step is small optimization to avoid
+          // calling get_physical_time() in every iteration as this would add
+          // a significant overhead.
+          if (physical_time < t_next.time_point())
+            physical_time = get_physical_time();
+
+          // If physical time is still smaller than the next logical time point,
+          // then wait until the next tag or until a new event is inserted
+          // asynchronously into the queue
+          if (physical_time < t_next.time_point()) {
+            auto status = cv_schedule.wait_until(lock, t_next.time_point());
+            // Start over if the event queue was modified
+            if (status == std::cv_status::no_timeout) {
+              return true;
+            } else {
+              // update physical time and continue otherwise
+              physical_time = t_next.time_point();
+            }
           }
         }
+
+        // retrieve all events with tag equal to current logical time from the
+        // queue
+        events = std::move(event_queue.begin()->second);
+        event_queue.erase(event_queue.begin());
+
+        // advance logical time
+        log::Debug() << "advance logical time to tag [" << t_next.time_point()
+                     << ", " << t_next.micro_step() << "]";
+        _logical_time.advance_to(t_next);
       }
-
-      // retrieve all events with tag equal to current logical time from the
-      // queue
-      events = std::move(event_queue.begin()->second);
-      event_queue.erase(event_queue.begin());
-
-      // advance logical time
-      log::Debug() << "advance logical time to tag [" << t_next.time_point()
-                   << ", " << t_next.micro_step() << "]";
-      _logical_time.advance_to(t_next);
     }
   }  // mutex m_schedule
 
@@ -253,7 +266,9 @@ void Scheduler::execute_reactions_inline(
 }
 
 Scheduler::Scheduler(Environment* env)
-    : using_workers(env->num_workers() > 1), _environment(env) {}
+    : using_workers(env->num_workers() > 1), _environment(env) {
+  next_microstep_event_map = std::make_unique<EventMap>();
+}
 
 Scheduler::~Scheduler() {}
 
@@ -275,13 +290,18 @@ void Scheduler::schedule_sync(const Tag& tag,
     tracepoint(reactor_cpp, schedule_action, action->container()->fqn(),
                action->name(), tag);
 
-    // create a new event map or retrieve the existing one
-    auto emplace_result =
-        event_queue.try_emplace(tag, std::make_unique<EventMap>());
-    auto& event_map = *emplace_result.first->second;
+    if (tag == Tag::from_logical_time(_logical_time).delay()) {
+      log::Debug() << "Schedule with shortcut";
+      (*next_microstep_event_map)[action] = setup;
+    } else {
+      // create a new event map or retrieve the existing one
+      auto emplace_result =
+          event_queue.try_emplace(tag, std::make_unique<EventMap>());
+      auto& event_map = *emplace_result.first->second;
 
-    // insert the new event
-    event_map[action] = setup;
+      // insert the new event
+      event_map[action] = setup;
+    }
   }
 }
 
