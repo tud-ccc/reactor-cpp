@@ -26,7 +26,7 @@ class Scheduler {
  public:
   using WorkItem = std::packaged_task<void(void)>;
   using WorkPtr = std::unique_ptr<WorkItem>;
-  using EventMap = std::map<BaseAction*, std::function<void(void)>>;
+  using EventMap = std::unordered_map<BaseAction*, std::function<void(void)>>;
 
  private:
   const bool using_workers;
